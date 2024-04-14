@@ -1,0 +1,21 @@
+[package]
+name = "defmt-rtt-printer"
+version = "0.1.0"
+edition = "2021"
+authors = ["Jon Lamb"]
+license = "MIT OR Apache-2.0"
+description = "Connect to a target and print defmt frames from an RTT buffer"
+repository = "https://github.com/jonlamb-gh/defmt-rtt-printer"
+
+[dependencies]
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+probe-rs = "0.23"
+defmt-decoder = { version = "0.3", features = ["unstable"] }
+goblin = "0.8"
+clap = { version = "4.5", features = ["derive", "env", "color"] }
+humantime = "2"
+ctrlc = { version = "3.4", features = ["termination"] }
+
+[profile.release]
+strip="debuginfo"
