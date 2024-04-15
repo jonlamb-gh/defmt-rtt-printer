@@ -3,8 +3,8 @@ use defmt_decoder::{DecodeError, Frame, Location, Locations, Table};
 use probe_rs::{
     config::MemoryRegion,
     probe::{list::Lister, DebugProbeSelector, WireProtocol},
-    rtt::{Rtt, ScanRegion},
-    Core, Permissions, VectorCatchCondition,
+    rtt::{ChannelMode, Rtt, ScanRegion},
+    Core, CoreStatus, HaltReason, Permissions, RegisterValue, VectorCatchCondition,
 };
 use std::{
     env, fs, io,
@@ -82,6 +82,18 @@ struct Opts {
     #[arg(short, long)]
     pub verbose: bool,
 
+    /// Set a breakpoint on the address of the given symbol when
+    /// enabling RTT BlockIfFull channel mode.
+    ///
+    /// Can be an absolute address or symbol name.
+    #[arg(long)]
+    pub breakpoint: Option<String>,
+
+    /// Assume thumb mode when resolving symbols from the ELF file
+    /// for breakpoints.
+    #[arg(long, requires = "breakpoint")]
+    pub thumb: bool,
+
     /// The ELF file containing the defmt table and location information.
     #[clap(name = "elf-file", verbatim_doc_comment)]
     pub elf_file: PathBuf,
@@ -121,6 +133,9 @@ fn main() {
     let table = Table::parse(&elf_contents)
         .unwrap()
         .expect("Parse defmt table");
+
+    let mut buffer = vec![0_u8; 1024];
+    let mut decoder = table.new_stream_decoder();
 
     let location_info = {
         // This is essentially what probe-rs reports to the user
@@ -208,6 +223,35 @@ fn main() {
         .unwrap();
     core.clear_all_hw_breakpoints().unwrap();
 
+    if let Some(bp_sym_or_addr) = opts.breakpoint.as_ref() {
+        let num_bp = core.available_breakpoint_units().unwrap();
+        assert!(num_bp > 0, "No breakpoints available");
+
+        let bp_addr = if let Some(bp_addr) = bp_sym_or_addr
+            .parse::<u64>()
+            .ok()
+            .or(u64::from_str_radix(bp_sym_or_addr.trim_start_matches("0x"), 16).ok())
+        {
+            bp_addr
+        } else {
+            let mut file = fs::File::open(&opts.elf_file).expect("open elf file");
+            let bp_addr = get_symbol(&mut file, bp_sym_or_addr).unwrap();
+            if opts.thumb {
+                bp_addr & !1
+            } else {
+                bp_addr
+            }
+        };
+
+        debug!(
+            available_breakpoints = num_bp,
+            symbol_or_addr = bp_sym_or_addr,
+            addr = format_args!("0x{:X}", bp_addr),
+            "Setting breakpoint"
+        );
+        core.set_hw_breakpoint(bp_addr).unwrap();
+    }
+
     let mut rtt = match opts.attach_timeout {
         Some(to) if !to.is_zero() => {
             attach_retry_loop(&mut core, &memory_map, &rtt_scan_region, to).unwrap()
@@ -218,11 +262,6 @@ fn main() {
         }
     };
 
-    if opts.reset || opts.attach_under_reset {
-        debug!("Run core");
-        core.run().unwrap();
-    }
-
     let up_channel = rtt
         .up_channels()
         .take(opts.up_channel)
@@ -231,10 +270,45 @@ fn main() {
     let up_channel_name = up_channel.name().unwrap_or("NA");
     debug!(channel = up_channel.number(), name = up_channel_name, mode = ?up_channel_mode, buffer_size = up_channel.buffer_size(), "Opened up channel");
 
-    // TODO - add blocking/non-blocking mode control
+    if opts.reset || opts.attach_under_reset {
+        let sp_reg = core.stack_pointer();
+        let sp: RegisterValue = core.read_core_reg(sp_reg.id()).unwrap();
+        let pc_reg = core.program_counter();
+        let pc: RegisterValue = core.read_core_reg(pc_reg.id()).unwrap();
+        debug!(pc = %pc, sp = %sp, "Run core");
+        core.run().unwrap();
+    }
 
-    let mut buffer = vec![0_u8; 1024];
-    let mut decoder = table.new_stream_decoder();
+    if opts.breakpoint.is_some() {
+        debug!("Waiting for breakpoint");
+        'bp_loop: loop {
+            if intr.is_set() {
+                break;
+            }
+
+            match core.status().unwrap() {
+                CoreStatus::Running => (),
+                CoreStatus::Halted(halt_reason) => match halt_reason {
+                    HaltReason::Breakpoint(_) => break 'bp_loop,
+                    _ => {
+                        warn!(reason = ?halt_reason, "Unexpected halt reason");
+                        break 'bp_loop;
+                    }
+                },
+                state => panic!("Core is in an unexpected state {state:?}"),
+            }
+
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let mode = ChannelMode::BlockIfFull;
+        debug!(mode = ?mode, "Set channel mode");
+        up_channel.set_mode(&mut core, mode).unwrap();
+
+        debug!("Run core post breakpoint");
+        core.run().unwrap();
+    }
+
     loop {
         if intr.is_set() {
             break;
@@ -283,7 +357,9 @@ fn main() {
 
     debug!("Shutting down");
 
-    // TODO set channel mode to non-blocking on exit
+    up_channel
+        .set_mode(&mut core, ChannelMode::NoBlockTrim)
+        .unwrap();
 }
 
 fn get_location_info(
@@ -308,12 +384,16 @@ fn get_location_info(
 }
 
 fn get_rtt_symbol<T: io::Read + io::Seek>(file: &mut T) -> Option<u64> {
+    get_symbol(file, "_SEGGER_RTT")
+}
+
+fn get_symbol<T: io::Read + io::Seek>(file: &mut T, symbol: &str) -> Option<u64> {
     let mut buffer = Vec::new();
     if file.read_to_end(&mut buffer).is_ok() {
         if let Ok(binary) = goblin::elf::Elf::parse(buffer.as_slice()) {
             for sym in &binary.syms {
                 if let Some(name) = binary.strtab.get_at(sym.st_name) {
-                    if name == "_SEGGER_RTT" {
+                    if name == symbol {
                         return Some(sym.st_value);
                     }
                 }
